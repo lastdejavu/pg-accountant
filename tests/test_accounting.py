@@ -50,13 +50,20 @@ def _short(v: Any, limit: int = 90) -> str:
 
 
 def check(label: str, got, want) -> None:
-    global PASS, FAIL
+    """
+    یک انتظار را بررسی می‌کند.
+
+    روی شکست `AssertionError` می‌دهد تا هم در حالت اسکریپت و هم زیر pytest
+    به‌درستی به‌عنوان خطا ثبت شود (وگرنه تست همیشه سبز به‌نظر می‌رسد).
+    """
+    global PASS
     if got == want:
         PASS += 1
         print(f"  ✅ {label}: {_short(got)}")
     else:
-        FAIL += 1
-        print(f"  ❌ {label}\n       انتظار: {_short(want)}\n       دریافت: {_short(got)}")
+        raise AssertionError(
+            f"{label}\n       انتظار: {_short(want)}\n       دریافت: {_short(got)}"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -611,28 +618,45 @@ def test_telegram_dispatch() -> None:
     check("چت مجاز پاسخ می‌گیرد", len(sent) > 0, True)
 
 
+ALL_TESTS = (
+    test_main_scenario,
+    test_deleted_before_seen,
+    test_bulk_reset_without_log,
+    test_topup,
+    test_no_double_count_on_restart,
+    test_backfill_window,
+    test_orphan_users,
+    test_report_rendering,
+    test_telegram_dispatch,
+    test_helpers,
+    test_env_parsing,
+)
+
+
 def main() -> int:
+    global FAIL
     print("=" * 68)
     print(" تست سنجه‌ی حسابداری pg-accountant")
     print("=" * 68)
-    for fn in (
-        test_main_scenario,
-        test_deleted_before_seen,
-        test_bulk_reset_without_log,
-        test_topup,
-        test_no_double_count_on_restart,
-        test_backfill_window,
-        test_orphan_users,
-        test_report_rendering,
-        test_telegram_dispatch,
-        test_helpers,
-        test_env_parsing,
-    ):
-        fn()
+
+    failed: list[tuple[str, str]] = []
+    for fn in ALL_TESTS:
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001
+            FAIL += 1
+            failed.append((fn.__name__, str(exc)))
+            print(f"  ❌ شکست: {exc}")
+
     print("\n" + "=" * 68)
-    print(f" نتیجه: {PASS} موفق / {FAIL} ناموفق")
+    if failed:
+        print(f" نتیجه: {PASS} موفق / {len(failed)} تست شکست‌خورده")
+        for name, _ in failed:
+            print(f"   ✗ {name}")
+    else:
+        print(f" نتیجه: {PASS} موفق / ۰ ناموفق")
     print("=" * 68)
-    return 1 if FAIL else 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
@@ -46,11 +46,6 @@ from zoneinfo import ZoneInfo
 import requests
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
-
-try:  # pragma: no cover - اختیاری، فقط برای لاگ رنگی
-    pass
-except Exception:  # pragma: no cover
-    pass
 
 APP_NAME = "pg-accountant"
 VERSION = "1.0.0"
@@ -66,6 +61,15 @@ MB = 1024 ** 2
 TB = 1024 ** 4
 
 FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+# آفست ثابت برای وقتی که بسته‌ی tzdata روی سرور نصب نیست.
+# ایران از فروردین ۱۴۰۱ (۲۰۲۲) ساعت تابستانی را لغو کرده، پس آفست ثابت است.
+_TZ_FALLBACKS: dict[str, tzinfo] = {
+    "Asia/Tehran": timezone(timedelta(hours=3, minutes=30)),
+    "Iran": timezone(timedelta(hours=3, minutes=30)),
+    "UTC": timezone.utc,
+    "Etc/UTC": timezone.utc,
+}
 
 
 def fa(value: Any) -> str:
@@ -122,8 +126,28 @@ class Config:
     dry_run_telegram: bool = False      # ارسال واقعی به تلگرام انجام نشود (تست)
 
     @property
-    def tz(self) -> ZoneInfo:
-        return ZoneInfo(self.timezone)
+    def tz(self) -> tzinfo:
+        """
+        منطقه‌ی زمانی پیکربندی‌شده.
+
+        اگر بسته‌ی tzdata روی سرور نصب نباشد، `ZoneInfo` استثنا می‌دهد و بات
+        اصلاً بالا نمی‌آید. در آن حالت به یک آفست ثابت برمی‌گردیم تا گزارش‌ها
+        همچنان به وقت محلی بروند. ایران از فروردین ۱۴۰۱ ساعت تابستانی ندارد،
+        پس +۰۳:۳۰ ثابت است.
+        """
+        name = self.timezone
+        try:
+            return ZoneInfo(name)
+        except Exception as exc:  # noqa: BLE001
+            fallback = _TZ_FALLBACKS.get(name, timezone(timedelta(hours=3, minutes=30)))
+            log.warning(
+                "منطقه‌ی زمانی %r در دسترس نیست (%s) — از آفست ثابت %s استفاده می‌شود. "
+                "برای رفع: pip install tzdata",
+                name,
+                exc,
+                fallback.utcoffset(None),
+            )
+            return fallback
 
     def num(self, v: Any) -> str:
         return fa(v) if self.persian_digits else str(v)
