@@ -186,6 +186,7 @@ sudo tail -f /var/log/pg-accountant.log
 | `scan_interval` | `60` | فاصله‌ی اسکن‌ها به ثانیه |
 | `reset_drop_tolerance` | `1048576` | افت مصرف کمتر از این = ریست حساب نمی‌شود |
 | `count_topup` | `true` | افزایش حجم اکانت موجود بیل شود |
+| `read_only` | `true` | **قفل فقط‌خواندنی در سطح دیتابیس** — خاموش نکن |
 | `backfill_on_first_run` | `true` | اکانت‌های موجود در اولین اجرا ثبت شوند |
 | `backfill_days` | `30` | فقط اکانت‌های این چند روز اخیر backfill شوند |
 | `report_show_user_list` | `true` | فهرست یوزرنیم‌ها در گزارش بیاید |
@@ -331,7 +332,7 @@ await db.execute(delete(UserUsageResetLogs).where(UserUsageResetLogs.user_id.in_
 | پنجره‌ی از دست رفتن | صفر | `scan_interval` (پیش‌فرض ۶۰ ثانیه) |
 | دوام بعد از آپدیت پنل | ممکن است migration آن را بپراند | مستقل از اسکیمای داخلی پنل |
 | گزارش‌های تعاملی | ندارد | `/report` `/week` `/admin` `/user` |
-| تست خودکار | ندارد | ۱۲۲ بررسی + CI |
+| تست خودکار | ندارد | ۱۴۰ بررسی + CI |
 
 **اگر پنلت MySQL/MariaDB است**، روش Trigger پنجره‌ی از دست رفتن ندارد و انتخاب
 بهتری است. **اگر PostgreSQL یا TimescaleDB داری** (که خودِ مستندات پاسارگارد
@@ -360,13 +361,44 @@ await db.execute(delete(UserUsageResetLogs).where(UserUsageResetLogs.user_id.in_
 
 ## امنیت
 
-- بات **فقط** از دیتابیس پنل `SELECT` می‌گیرد. هیچ `INSERT`/`UPDATE`/`DELETE` روی
-  دیتابیس پنل ندارد.
+### دیتابیس پنل در سطح دیتابیس قفل می‌شود
+
+بات فقط به این امید که کدش چیزی نمی‌نویسد، read-only نیست — اتصال در **سطح
+خودِ دیتابیس** قفل می‌شود:
+
+| دیتابیس | دستور قفل |
+|---|---|
+| SQLite | `PRAGMA query_only = ON` |
+| PostgreSQL / TimescaleDB | `SET default_transaction_read_only = on` |
+| MySQL / MariaDB | `SET SESSION TRANSACTION READ ONLY` |
+
+یعنی حتی اگر باگی در بات باشد، `INSERT`/`UPDATE`/`DELETE` از سمت دیتابیس رد
+می‌شود. این تنظیمات فقط روی **جلسه‌ی اتصال** اثر دارند و هیچ چیزی روی سرور
+تغییر نمی‌دهند — نه نقش جدید، نه `GRANT`، نه تغییر فایل.
+
+`checkdb` این قفل را **واقعاً امتحان می‌کند** (یک نوشتن آزمایشی می‌زند و
+مطمئن می‌شود رد شده):
+
+```
+-- قفل فقط‌خواندنی --
+  نوشتن        : ✅ رد می‌شود — دیتابیس نوشتن را رد کرد (sqlite)
+```
+
+اگر قفل کار نکند، `checkdb` با کد خروج `۱` و پیام واضح برمی‌گردد.
+
+### بقیه
+
+- نصب‌کننده **هیچ دسترسی‌ای روی فایل‌های پنل تغییر نمی‌دهد** — حتی `chmod`.
+  تنها `chmod` روی `config.ini` خودِ بات است.
 - دفترکل در فایل جدا (`ledger.db`) است؛ پاک کردنش به پنل آسیب نمی‌زند.
 - `config.ini` با دسترسی `۶۰۰` نوشته می‌شود (فقط روت).
 - رمز دیتابیس در `config.ini` ذخیره نمی‌شود؛ هر بار از `.env` پنل خوانده می‌شود.
 - اگر `allowed_chat_ids` خالی باشد، هر کسی که بات را پیدا کند می‌تواند آمار
   ادمین‌هایت را ببیند. **حتماً پرش کن.**
+- بار بات روی دیتابیس پنل: دو `SELECT` ساده در هر دقیقه.
+
+برای حذف کامل، کافی است `/opt/pg-accountant/` و سرویسش را پاک کنی —
+هیچ اثری روی پنل نمی‌ماند.
 
 ---
 
@@ -377,7 +409,7 @@ git clone https://github.com/lastdejavu/pg-accountant.git
 cd pg-accountant
 python3 -m pip install -r requirements.txt pytest
 
-python3 tests/test_accounting.py            # ۹۴ بررسی (حالت اسکریپت)
+python3 tests/test_accounting.py            # ۱۱۲ بررسی (حالت اسکریپت)
 python3 -m pytest tests/test_accounting.py  # همان، زیر pytest
 bash tests/e2e.sh                           # ۲۸ بررسی end-to-end با CLI واقعی
 bash -n install.sh                          # سینتکس نصب
@@ -405,7 +437,7 @@ pg-accountant/
 │   └── test.yml           CI روی سه نسخه‌ی پایتون
 └── tests/
     ├── schema_panel.sql   اسکیمای پنل برای تست
-    ├── test_accounting.py ۹۴ بررسی واحد
+    ├── test_accounting.py ۱۱۲ بررسی واحد
     └── e2e.sh             ۲۸ بررسی end-to-end
 ```
 

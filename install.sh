@@ -24,7 +24,6 @@ PY="${PYTHON:-python3}"
 BOT_TOKEN=""
 CHAT_IDS=""
 NO_START=0
-FIX_SQLITE_PERMS=0
 
 green()  { printf '\033[32m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
@@ -37,7 +36,6 @@ while [[ $# -gt 0 ]]; do
         --chats)      CHAT_IDS="$2"; shift 2 ;;
         --panel-env)  PANEL_ENV="$2"; shift 2 ;;
         --no-start)   NO_START=1; shift ;;
-        --fix-sqlite-perms) FIX_SQLITE_PERMS=1; shift ;;
         -h|--help)
             sed -n '2,20p' "$0"; exit 0 ;;
         *) red "آرگومان ناشناخته: $1"; exit 1 ;;
@@ -127,24 +125,16 @@ if [[ -n "$DRIVER" ]]; then
 fi
 
 # SQLite پنل معمولاً در /var/lib/pasarguard/db.sqlite3 است.
-# اگر بات با یوزری غیر از مالک فایل اجرا شود، خواندنش ممکن نیست.
-# خودکار chmod نمی‌کنیم چون `a+r` دیتابیس پنل را برای همه‌ی یوزرهای سرور
-# خواندنی می‌کند و این یک ضعف امنیتی است. فقط راهنمایی می‌دهیم.
+# ما هیچ دسترسی‌ای روی فایل‌های پنل تغییر نمی‌دهیم — حتی chmod.
+# فقط مالک فایل را گزارش می‌دهیم تا اگر لازم شد خودت تصمیم بگیری.
 if [[ -n "$DB_URL" && "$DB_URL" == sqlite* ]]; then
     SQLITE_PATH="$(echo "$DB_URL" | sed -E 's#^sqlite(\+aiosqlite)?://##')"
     if [[ -f "$SQLITE_PATH" ]]; then
         OWNER="$(stat -c '%U' "$SQLITE_PATH" 2>/dev/null || echo '?')"
-        if [[ "$FIX_SQLITE_PERMS" -eq 1 ]]; then
-            chmod a+r "$SQLITE_PATH" 2>/dev/null || true
-            yellow "با --fix-sqlite-perms دسترسی خواندن به $SQLITE_PATH داده شد."
-            yellow "توجه: این فایل حالا برای همه‌ی یوزرهای این سرور خواندنی است."
-        else
-            yellow "دیتابیس SQLite متعلق به «$OWNER» است: $SQLITE_PATH"
-            yellow "چون سرویس با روت اجرا می‌شود معمولاً مشکلی نیست. اگر خطای"
-            yellow "«Permission denied» گرفتی، یکی از این دو:"
-            yellow "    ۱) نصب را با --fix-sqlite-perms دوباره اجرا کن (فایل را world-readable می‌کند)"
-            yellow "    ۲) یا دستی:  chmod a+r $SQLITE_PATH"
-        fi
+        green "دیتابیس SQLite پیدا شد: $SQLITE_PATH (مالک: $OWNER)"
+        green "این نصب هیچ دسترسی‌ای روی فایل‌های پنل تغییر نمی‌دهد."
+        yellow "اگر بعداً خطای «Permission denied» گرفتی، سرویس با روت اجرا می‌شود و"
+        yellow "معمولاً مشکلی نیست؛ در غیر این صورت خودت دستی تصمیم بگیر."
     fi
 fi
 
@@ -179,6 +169,7 @@ timezone = Asia/Tehran
 report_time = 00:00
 report_previous_day = true
 scan_interval = 60
+read_only = true
 reset_drop_tolerance = 1048576
 count_topup = true
 backfill_on_first_run = true

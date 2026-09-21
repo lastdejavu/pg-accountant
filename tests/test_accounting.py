@@ -685,6 +685,135 @@ def test_per_admin_report() -> None:
     check("ادمین پرحجم هم زیر سقف می‌ماند", all(len(m) <= 4096 for m in big_msgs), True)
 
 
+def test_read_only_lock() -> None:
+    """اتصال به دیتابیس پنل باید در سطح دیتابیس فقط‌خواندنی باشد."""
+    print("\n=== قفل فقط‌خواندنی روی دیتابیس پنل ===")
+    import hashlib
+    import os
+    import sqlite3
+    import tempfile
+
+    from bot import PanelDB
+    from sqlalchemy import text
+
+    tmp = tempfile.mkdtemp()
+    db_path = os.path.join(tmp, "panel.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        (Path(__file__).resolve().parent / "schema_panel.sql").read_text(encoding="utf-8")
+    )
+    # created_at باید تازه باشد، وگرنه بیرون از پنجره‌ی backfill_days می‌افتد
+    # و بات درست بیلش نمی‌کند (رفتار صحیح بات، نه باگ).
+    recent = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO admins(id, username, hashed_password, created_at) VALUES(1,'ali','x',?)",
+        (recent,),
+    )
+    conn.execute(
+        "INSERT INTO users(id, username, status, used_traffic, data_limit, admin_id, created_at)"
+        " VALUES(1,'u1','active',0,1000,1,?)",
+        (recent,),
+    )
+    conn.commit()
+    conn.close()
+
+    def digest() -> str:
+        with open(db_path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+
+    # --- گروه کنترل: بدون قفل، نوشتن باید موفق شود ------------------- #
+    open_db = PanelDB(f"sqlite:///{db_path}", read_only=False)
+    wrote = False
+    try:
+        with open_db.engine.connect() as c:
+            c.execute(text("INSERT INTO admins(id, username, hashed_password) VALUES(99,'hax','x')"))
+            c.commit()
+            wrote = True
+    except Exception:
+        wrote = False
+    open_db.dispose()
+    check("گروه کنترل: بدون قفل نوشتن ممکن است", wrote, True)
+    # پاک کردن رد پای گروه کنترل
+    cleanup = sqlite3.connect(db_path)
+    cleanup.execute("DELETE FROM admins WHERE id = 99")
+    cleanup.commit()
+    cleanup.close()
+    baseline = digest()
+
+    # --- قفل فعال ----------------------------------------------------- #
+    locked = PanelDB(f"sqlite:///{db_path}", read_only=True)
+    check("verify_read_only قفل را تأیید می‌کند", locked.verify_read_only()[0], True)
+
+    blocked = {"INSERT": 0, "UPDATE": 0, "DELETE": 0, "DROP": 0}
+    attempts = {
+        "INSERT": "INSERT INTO admins(id, username, hashed_password) VALUES(7,'x','y')",
+        "UPDATE": "UPDATE users SET used_traffic = 999 WHERE id = 1",
+        "DELETE": "DELETE FROM users WHERE id = 1",
+        "DROP": "DROP TABLE users",
+    }
+    for label, sql in attempts.items():
+        try:
+            with locked.engine.connect() as c:
+                c.execute(text(sql))
+                c.commit()
+        except Exception:
+            blocked[label] = 1
+    check("INSERT رد شد", blocked["INSERT"], 1)
+    check("UPDATE رد شد", blocked["UPDATE"], 1)
+    check("DELETE رد شد", blocked["DELETE"], 1)
+    check("DROP رد شد", blocked["DROP"], 1)
+
+    # --- خواندن همچنان کار می‌کند -------------------------------------- #
+    check("خواندن ادمین‌ها کار می‌کند", len(locked.admins()), 1)
+    check("خواندن کاربرها کار می‌کند", len(locked.users()), 1)
+    check("healthcheck کار می‌کند", locked.healthcheck(), "ok")
+
+    # --- چرخه‌ی کامل حسابداری ------------------------------------------ #
+    ledger = Ledger(os.path.join(tmp, "ledger.db"))
+    acc = Accountant(Config(ledger_path=ledger.path), locked, ledger)
+    res = acc.scan()
+    check("اسکن با دیتابیس قفل‌شده کار می‌کند", res.provisioned, 1)
+    check("اسکن خطایی نداشت", res.errors, [])
+    res2 = acc.scan()
+    check("اسکن دوم هم بدون خطا", res2.errors, [])
+
+    locked.dispose()
+    ledger.close()
+
+    after = digest()
+    # نکته: `before` با `baseline` فرق دارد چون گروه کنترل یک ردیف را INSERT و
+    # بعد DELETE کرد و SQLite با DELETE بایت‌های فایل را برنمی‌گرداند (صفحات
+    # آزاد می‌مانند). چک معنادار این است که فازِ قفل‌شده چیزی عوض نکرده باشد.
+    check("فاز قفل‌شده هیچ بایتی از دیتابیس پنل را عوض نکرد", after, baseline)
+
+    # --- تأیید محتوایی ------------------------------------------------- #
+    final = sqlite3.connect(db_path)
+    check("اکانت u1 هنوز هست", final.execute("SELECT COUNT(*) FROM users").fetchone()[0], 1)
+    check(
+        "used_traffic دست‌نخورده",
+        final.execute("SELECT used_traffic FROM users WHERE id=1").fetchone()[0],
+        0,
+    )
+    check(
+        "جدول users سر جایش است",
+        final.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'"
+        ).fetchone()[0],
+        1,
+    )
+    check(
+        "ردپای گروه کنترل (id=99) نمانده",
+        final.execute("SELECT COUNT(*) FROM admins WHERE id=99").fetchone()[0],
+        0,
+    )
+    check(
+        "فقط یک ادمین هست",
+        final.execute("SELECT COUNT(*) FROM admins").fetchone()[0],
+        1,
+    )
+    final.close()
+
+
 ALL_TESTS = (
     test_main_scenario,
     test_deleted_before_seen,
@@ -698,6 +827,7 @@ ALL_TESTS = (
     test_telegram_dispatch,
     test_helpers,
     test_env_parsing,
+    test_read_only_lock,
 )
 
 

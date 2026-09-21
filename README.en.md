@@ -187,6 +187,7 @@ Then send `/today` to your bot.
 | `scan_interval` | `60` | Seconds between scans |
 | `reset_drop_tolerance` | `1048576` | Usage drops below this are not treated as a reset |
 | `count_topup` | `true` | Bill increases to an existing account's limit |
+| `read_only` | `true` | **Enforce read-only at the database level** — keep this on |
 | `backfill_on_first_run` | `true` | Record accounts that already exist on first run |
 | `backfill_days` | `30` | Only backfill accounts created within this many days |
 | `report_show_user_list` | `true` | Include usernames in the report |
@@ -333,7 +334,7 @@ Both are legitimate; they trade off differently:
 | Miss window | zero | `scan_interval` (60 s default) |
 | Survives panel upgrades | a migration can drop it | independent of the panel's internal schema |
 | Interactive reports | no | `/report` `/week` `/admin` `/user` |
-| Automated tests | no | 122 checks + CI |
+| Automated tests | no | 140 checks + CI |
 
 **If your panel runs MySQL/MariaDB**, triggers have no miss window and are the
 better choice. **If you run PostgreSQL or TimescaleDB** — which the PasarGuard
@@ -363,8 +364,35 @@ and this project is the option that works.
 
 ## Security
 
-- The bot issues **only** `SELECT` against the panel database. No
-  `INSERT`/`UPDATE`/`DELETE` ever touches it.
+### The panel database is locked at the database level
+
+The bot is not read-only merely because its code happens to avoid writing. The
+connection itself is locked **by the database**:
+
+| Database | Lock statement |
+|---|---|
+| SQLite | `PRAGMA query_only = ON` |
+| PostgreSQL / TimescaleDB | `SET default_transaction_read_only = on` |
+| MySQL / MariaDB | `SET SESSION TRANSACTION READ ONLY` |
+
+So even if a bug slipped into the bot, any `INSERT`/`UPDATE`/`DELETE` would be
+rejected by the database itself. These settings affect only the **session** —
+nothing is changed on the server. No new role, no `GRANT`, no file changes.
+
+`checkdb` **actually tests** this lock (it attempts a write and confirms it is
+rejected):
+
+```
+-- قفل فقط‌خواندنی --
+  نوشتن        : ✅ رد می‌شود — دیتابیس نوشتن را رد کرد (sqlite)
+```
+
+If the lock is not working, `checkdb` exits `1` with a clear message.
+
+### Everything else
+
+- The installer **changes no permissions on any panel file** — not even
+  `chmod`. The only `chmod` is on the bot's own `config.ini`.
 - The ledger lives in a separate file (`ledger.db`); deleting it cannot harm
   the panel.
 - `config.ini` is written with mode `600` (root only).
@@ -372,6 +400,10 @@ and this project is the option that works.
   panel's `.env` on each start.
 - If `allowed_chat_ids` is empty, **anyone** who finds your bot can read your
   admins' statistics. Fill it in.
+- Load on the panel database: two plain `SELECT`s per minute.
+
+To remove the bot entirely, delete `/opt/pg-accountant/` and its service.
+Nothing is left behind in the panel.
 
 ---
 
@@ -382,7 +414,7 @@ git clone https://github.com/lastdejavu/pg-accountant.git
 cd pg-accountant
 python3 -m pip install -r requirements.txt pytest
 
-python3 tests/test_accounting.py            # 94 checks (script mode)
+python3 tests/test_accounting.py            # 112 checks (script mode)
 python3 -m pytest tests/test_accounting.py  # the same, under pytest
 bash tests/e2e.sh                           # 28 end-to-end checks via the real CLI
 bash -n install.sh                          # installer syntax
@@ -411,7 +443,7 @@ pg-accountant/
 │   └── test.yml           CI across three Python versions
 └── tests/
     ├── schema_panel.sql   panel schema for tests
-    ├── test_accounting.py 94 unit checks
+    ├── test_accounting.py 112 unit checks
     └── e2e.sh             28 end-to-end checks
 ```
 

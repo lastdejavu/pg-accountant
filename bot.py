@@ -44,7 +44,7 @@ from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 import requests
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
 
 APP_NAME = "pg-accountant"
@@ -114,6 +114,7 @@ class Config:
     scan_interval: int = 60             # فاصله‌ی اسکن‌ها به ثانیه
     # قوانین حسابداری
     reset_drop_tolerance: int = 1 * MB  # افت مصرف کمتر از این = ریست حساب نمی‌شود
+    read_only: bool = True              # اتصال به دیتابیس پنل در سطح دیتابیس قفل شود
     count_topup: bool = True            # افزایش حجم اکانت موجود حساب شود
     backfill_on_first_run: bool = True  # اکانت‌های موجود در اولین اجرا ثبت شوند
     backfill_days: int = 30             # فقط اکانت‌های ساخته‌شده در این چند روز اخیر
@@ -173,6 +174,7 @@ _BOOL_KEYS = {
     "backfill_on_first_run",
     "report_show_user_list",
     "report_per_admin",
+    "read_only",
     "persian_digits",
     "dry_run_telegram",
 }
@@ -625,10 +627,31 @@ class Ledger:
 
 
 class PanelDB:
-    """دسترسی فقط‌خواندنی به دیتابیس پنل PasarGuard."""
+    """
+    دسترسی فقط‌خواندنی به دیتابیس پنل PasarGuard.
 
-    def __init__(self, url: str, *, timeout: int = 15):
+    وقتی `read_only` فعال است (پیش‌فرض)، اتصال در سطح خودِ دیتابیس
+    قفل می‌شود — نه فقط به این امید که کد ما چیزی ننویسد:
+
+      SQLite      →  PRAGMA query_only = ON
+      PostgreSQL  →  SET default_transaction_read_only = on
+      MySQL       →  SET SESSION TRANSACTION READ ONLY
+
+    با این کار هر `INSERT`/`UPDATE`/`DELETE` تصادفی از سمت دیتابیس رد می‌شود.
+    این تنظیمات فقط روی «جلسه‌ی اتصال» اثر دارند و هیچ چیزی را روی سرور
+    تغییر نمی‌دهند (نه نقش جدید، نه GRANT، نه تغییر فایل).
+    """
+
+    #: دستوری که برای هر دیالکت، جلسه را فقط‌خواندنی می‌کند.
+    _READ_ONLY_SQL = {
+        "sqlite": "PRAGMA query_only = ON",
+        "postgresql": "SET default_transaction_read_only = on",
+        "mysql": "SET SESSION TRANSACTION READ ONLY",
+    }
+
+    def __init__(self, url: str, *, timeout: int = 15, read_only: bool = True):
         self.url = url
+        self.read_only = read_only
         kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
         if url.startswith("sqlite"):
             kwargs["connect_args"] = {"timeout": timeout}
@@ -653,6 +676,60 @@ class PanelDB:
                     else f"    pip install {exc.name}"
                 )
             ) from exc
+
+        if read_only:
+            self._install_read_only_guard()
+
+    def _install_read_only_guard(self) -> None:
+        """روی هر اتصال تازه، جلسه را فقط‌خواندنی می‌کند."""
+        dialect = self.engine.dialect.name
+        stmt = self._READ_ONLY_SQL.get(dialect)
+        if not stmt:
+            log.warning(
+                "دیالکت %r را نمی‌شناسم؛ قفل فقط‌خواندنی اعمال نشد. "
+                "بات همچنان فقط SELECT اجرا می‌کند، ولی دیتابیس جلوی نوشتن را نمی‌گیرد.",
+                dialect,
+            )
+            return
+
+        @event.listens_for(self.engine, "connect")
+        def _lock_session(dbapi_conn, _record):  # noqa: ANN001
+            cursor = dbapi_conn.cursor()
+            try:
+                cursor.execute(stmt)
+            finally:
+                cursor.close()
+
+        log.info("قفل فقط‌خواندنی روی اتصال دیتابیس پنل فعال شد (%s)", dialect)
+
+    def verify_read_only(self) -> tuple[bool, str]:
+        """
+        واقعاً امتحان می‌کند که نوشتن رد می‌شود.
+
+        یک INSERT نامعتبر روی جدولی که وجود ندارد اجرا می‌کنیم؛ اگر قفل فعال
+        باشد خطای «readonly / read-only» می‌گیریم. اگر خطای «no such table»
+        بگیریم یعنی قفل اعمال نشده (چون دیتابیس تا مرحله‌ی بررسی جدول رفته).
+        """
+        if not self.read_only:
+            return False, "read_only غیرفعال است"
+        dialect = self.engine.dialect.name
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(text("INSERT INTO __pg_accountant_readonly_probe (x) VALUES (1)"))
+                conn.rollback()
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            blocked_markers = ("readonly", "read-only", "read only", "cannot execute")
+            if any(m in msg for m in blocked_markers):
+                return True, f"دیتابیس نوشتن را رد کرد ({dialect})"
+            # «no such table» یعنی دیتابیس اصلاً نپرسیده جلسه read-only است یا نه
+            if "no such table" in msg or "does not exist" in msg or "doesn't exist" in msg:
+                return False, (
+                    "قفل فقط‌خواندنی اعمال نشده — دیتابیس تا مرحله‌ی بررسی جدول رفت. "
+                    f"دیالکت: {dialect}"
+                )
+            return True, f"نوشتن رد شد: {str(exc)[:120]}"
+        return False, "نوشتن رد نشد! قفل فقط‌خواندنی کار نمی‌کند"
 
     def dispose(self) -> None:
         try:
@@ -701,9 +778,16 @@ class PanelDB:
             "SELECT user_id, used_traffic_at_reset, reset_at FROM user_usage_logs "
             "WHERE reset_at >= :since"
         )
+        # sqlite3 از پایتون ۳٫۱۲ آداپتر پیش‌فرض datetime را deprecated کرده،
+        # پس برای SQLite رشته‌ی ISO می‌فرستیم. بقیه‌ی درایورها خود datetime
+        # را درست هندل می‌کنند.
+        if self.engine.dialect.name == "sqlite":
+            param: Any = since.astimezone(timezone.utc).isoformat(sep=" ")
+        else:
+            param = since
         with self.engine.connect() as conn:
             try:
-                rows = conn.execute(sql, {"since": since}).fetchall()
+                rows = conn.execute(sql, {"since": param}).fetchall()
             except Exception:
                 if strict:
                     raise
@@ -1624,7 +1708,7 @@ def build_accountant(cfg: Config) -> tuple[Accountant, PanelDB, Ledger]:
         )
     if not cfg.bot_token and not cfg.dry_run_telegram:
         raise SystemExit("توکن تلگرام تنظیم نشده است (bot_token).")
-    panel = PanelDB(cfg.panel_db_url)
+    panel = PanelDB(cfg.panel_db_url, read_only=cfg.read_only)
     ledger = Ledger(cfg.ledger_path)
     return Accountant(cfg, panel, ledger), panel, ledger
 
@@ -1653,6 +1737,19 @@ def checkdb(panel: PanelDB, cfg: Config) -> int:
         return 1
 
     print(f"نوع دیتابیس  : {panel.db_kind()}")
+
+    # قفل فقط‌خواندنی باید واقعاً نوشتن را رد کند
+    print("\n-- قفل فقط‌خواندنی --")
+    if not panel.read_only:
+        print("  ⚠️  read_only = false است؛ دیتابیس جلوی نوشتن را نمی‌گیرد")
+        problems.append("read_only غیرفعال است")
+    else:
+        ok, detail = panel.verify_read_only()
+        if ok:
+            print(f"  نوشتن        : ✅ رد می‌شود — {detail}")
+        else:
+            print(f"  نوشتن        : ❌ رد نمی‌شود — {detail}")
+            problems.append("قفل فقط‌خواندنی کار نمی‌کند")
 
     schema = panel.inspect_schema()
     print("\n-- ستون‌های مورد نیاز --")
