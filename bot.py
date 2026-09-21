@@ -604,7 +604,23 @@ class PanelDB:
             kwargs["pool_size"] = 1
             kwargs["max_overflow"] = 0
             kwargs["pool_recycle"] = 300
-        self.engine: Engine = create_engine(url, **kwargs)
+        try:
+            self.engine: Engine = create_engine(url, **kwargs)
+        except ModuleNotFoundError as exc:
+            raise SystemExit(
+                f"درایور دیتابیس نصب نیست ({exc.name}).\n"
+                f"  آدرس دیتابیس: {url}\n"
+                f"  راه‌حل:\n"
+                + (
+                    "    pip install psycopg2-binary\n"
+                    "    (اگر نصب نشد:  pip install \"psycopg[binary]\"  و در آدرس دیتابیس\n"
+                    "     postgresql+psycopg2 را به postgresql+psycopg تغییر بده)"
+                    if "postgresql" in url
+                    else "    pip install \"pymysql[cryptography]\""
+                    if "mysql" in url
+                    else f"    pip install {exc.name}"
+                )
+            ) from exc
 
     def dispose(self) -> None:
         try:
@@ -638,13 +654,16 @@ class PanelDB:
             )
         return out
 
-    def usage_reset_logs_since(self, since: datetime) -> list[dict[str, Any]]:
+    def usage_reset_logs_since(self, since: datetime, *, strict: bool = False) -> list[dict[str, Any]]:
         """
         ریست‌های ثبت‌شده در user_usage_logs.
 
         نکته: ریست دسته‌جمعی پنل این جدول را پاک می‌کند و چیزی نمی‌نویسد،
         پس این فقط یک منبع کمکی است؛ منبع اصلی تشخیص ریست، مقایسه‌ی
         used_traffic بین دو اسکن است.
+
+        در حالت عادی (strict=False) خطا را قورت می‌دهد تا اسکن نشکند؛
+        برای checkdb با strict=True صدا می‌شود تا مشکل پنهان نماند.
         """
         sql = text(
             "SELECT user_id, used_traffic_at_reset, reset_at FROM user_usage_logs "
@@ -654,6 +673,8 @@ class PanelDB:
             try:
                 rows = conn.execute(sql, {"since": since}).fetchall()
             except Exception:
+                if strict:
+                    raise
                 return []
         out = []
         for r in rows:
@@ -670,6 +691,22 @@ class PanelDB:
         with self.engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         return "ok"
+
+    def db_kind(self) -> str:
+        return self.engine.dialect.name
+
+    def inspect_schema(self) -> dict[str, list[str]]:
+        """ستون‌های واقعیِ جدول‌های پنل را برمی‌گرداند (برای اعتبارسنجی)."""
+        from sqlalchemy import inspect as sa_inspect
+
+        insp = sa_inspect(self.engine)
+        existing = set(insp.get_table_names())
+        out: dict[str, list[str]] = {}
+        for table in ("admins", "users", "user_usage_logs"):
+            out[table] = (
+                [c["name"] for c in insp.get_columns(table)] if table in existing else []
+            )
+        return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1464,6 +1501,94 @@ def build_accountant(cfg: Config) -> tuple[Accountant, PanelDB, Ledger]:
     return Accountant(cfg, panel, ledger), panel, ledger
 
 
+REQUIRED_COLUMNS = {
+    "admins": ["id", "username"],
+    "users": ["id", "username", "admin_id", "data_limit", "used_traffic", "created_at"],
+    "user_usage_logs": ["user_id", "used_traffic_at_reset", "reset_at"],
+}
+
+
+def checkdb(panel: PanelDB, cfg: Config) -> int:
+    """
+    اعتبارسنجی کامل دیتابیس پنل.
+
+    روی سرور واقعی اجرا می‌شود تا مطمئن شویم اسکیمای پنل با کوئری‌های بات
+    سازگار است (مخصوصاً برای PostgreSQL/TimescaleDB که این‌جا تست نشده).
+    """
+    problems: list[str] = []
+    print(f"آدرس دیتابیس : {cfg.panel_db_url.split('@')[-1]}")
+    try:
+        panel.healthcheck()
+        print("اتصال        : ✅ برقرار")
+    except Exception as exc:  # noqa: BLE001
+        print(f"اتصال        : ❌ ناموفق — {exc}")
+        return 1
+
+    print(f"نوع دیتابیس  : {panel.db_kind()}")
+
+    schema = panel.inspect_schema()
+    print("\n-- ستون‌های مورد نیاز --")
+    for table, cols in REQUIRED_COLUMNS.items():
+        found = schema.get(table, [])
+        if not found:
+            print(f"  {table:18} ❌ جدول وجود ندارد")
+            problems.append(f"جدول {table} پیدا نشد")
+            continue
+        missing = [c for c in cols if c not in found]
+        if missing:
+            print(f"  {table:18} ⚠️  ستون‌های غایب: {', '.join(missing)}")
+            problems.append(f"{table}: ستون‌های {', '.join(missing)} غایب‌اند")
+        else:
+            print(f"  {table:18} ✅ {len(found)} ستون، همه‌ی موارد لازم موجود")
+
+    print("\n-- اجرای کوئری‌های واقعی --")
+    try:
+        admins = panel.admins()
+        print(f"  admins()                ✅ {len(admins)} ادمین")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  admins()                ❌ {exc}")
+        problems.append("کوئری admins ناموفق")
+        admins = {}
+
+    try:
+        users = panel.users()
+        print(f"  users()                 ✅ {len(users)} کاربر")
+        limited = sum(1 for u in users if u.data_limit)
+        unlimited = sum(1 for u in users if not u.data_limit)
+        print(f"      محدود: {limited}   نامحدود: {unlimited}")
+        if users:
+            sample = users[0]
+            print(f"      نمونه: {sample.username!r} limit={sample.data_limit} "
+                  f"used={sample.used_traffic} admin_id={sample.admin_id}")
+            if sample.created_at is None:
+                print("      ⚠️  created_at این کاربر خالی بود")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  users()                 ❌ {exc}")
+        problems.append("کوئری users ناموفق")
+        users = []
+
+    try:
+        logs = panel.usage_reset_logs_since(
+            datetime.now(timezone.utc) - timedelta(days=30), strict=True
+        )
+        print(f"  usage_reset_logs_since  ✅ {len(logs)} ریست در ۳۰ روز اخیر")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  usage_reset_logs_since  ❌ {exc}")
+        problems.append("کوئری user_usage_logs ناموفق")
+
+    if not admins and not users:
+        problems.append("هیچ ادمین یا کاربری خوانده نشد — دیتابیس خالی یا اشتباه است")
+
+    print()
+    if problems:
+        print("❌ مشکلات یافت‌شده:")
+        for p in problems:
+            print(f"   • {p}")
+        return 1
+    print("✅ دیتابیس پنل با بات سازگار است.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ربات حسابداری حجم ادمین‌های PasarGuard")
     parser.add_argument("-c", "--config", help="مسیر فایل config.ini")
@@ -1480,6 +1605,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("daily", help="گزارش روزانه را همین حالا تولید و ارسال کن")
     sub.add_parser("status", help="وضعیت را چاپ کن")
     sub.add_parser("health", help="اتصال به دیتابیس پنل را بررسی کن")
+    sub.add_parser("checkdb", help="اسکیمای دیتابیس پنل را کامل اعتبارسنجی کن")
 
     p_run = sub.add_parser("run", help="اجرای دائمی (اسکن + تلگرام + گزارش خودکار)")
     p_run.add_argument("--no-telegram", action="store_true", help="فقط اسکن و گزارش، بدون تلگرام")
@@ -1495,6 +1621,9 @@ def main(argv: list[str] | None = None) -> int:
     accountant, panel, ledger = build_accountant(cfg)
 
     try:
+        if args.cmd == "checkdb":
+            return checkdb(panel, cfg)
+
         if args.cmd == "health":
             print("panel db :", cfg.panel_db_url.split("@")[-1])
             print("health   :", panel.healthcheck())

@@ -101,8 +101,27 @@ else
 fi
 
 if [[ -n "$DRIVER" ]]; then
-    "$VPY" -m pip install --quiet "$DRIVER"
-    green "درایور $DRIVER نصب شد."
+    if "$VPY" -m pip install --quiet "$DRIVER"; then
+        green "درایور $DRIVER نصب شد."
+    else
+        red "نصب $DRIVER ناموفق بود."
+    fi
+
+    # بررسی کنیم درایور واقعاً import می‌شود — وگرنه بات با خطای گنگ بالا می‌آید
+    IMPORT_MOD="psycopg2"
+    [[ "$DRIVER" == pymysql* ]] && IMPORT_MOD="pymysql"
+    if ! "$VPY" -c "import $IMPORT_MOD" 2>/dev/null; then
+        yellow "درایور $IMPORT_MOD قابل import نیست. در حال تلاش با جایگزین…"
+        if "$VPY" -m pip install --quiet "psycopg[binary]" && "$VPY" -c "import psycopg" 2>/dev/null; then
+            green "درایور psycopg (نسخه‌ی ۳) نصب شد."
+            yellow "در config.ini مقدار panel_db_url را دستی پر کن و به‌جای"
+            yellow "  postgresql+psycopg2://  از  postgresql+psycopg://  استفاده کن."
+        else
+            red "نصب درایور ناموفق بود. احتمالاً ابزار ساخت لازم داری:"
+            red "  Debian/Ubuntu:  apt install -y libpq-dev gcc python3-dev"
+            red "  RHEL/Rocky:     dnf install -y libpq-devel gcc python3-devel"
+        fi
+    fi
 fi
 
 # SQLite پنل معمولاً در /var/lib/pasarguard/db.sqlite3 است
