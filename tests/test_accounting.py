@@ -618,6 +618,73 @@ def test_telegram_dispatch() -> None:
     check("چت مجاز پاسخ می‌گیرد", len(sent) > 0, True)
 
 
+def test_per_admin_report() -> None:
+    """با ادمین‌های زیاد، برای هر ادمین یک پیام جدا برود."""
+    print("\n=== گزارش تک‌پیام‌به‌ازای‌هر‌ادمین ===")
+    cfg = Config(ledger_path=":memory:", report_per_admin=True)
+    panel, ledger, acc = make_env(cfg)
+
+    N_ADMINS, N_USERS = 30, 25
+    for a in range(1, N_ADMINS + 1):
+        panel.add_admin(a, f"admin_{a:02d}")
+    uid = 1
+    for a in range(1, N_ADMINS + 1):
+        for u in range(N_USERS):
+            panel.add_user(uid, f"a{a:02d}_u{u:02d}", a, 50 * GB, 0, acc.now())
+            uid += 1
+    res = acc.scan(now=acc.now())
+    check("همه‌ی اکانت‌ها ثبت شدند", res.provisioned, N_ADMINS * N_USERS)
+
+    day = acc.now().strftime("%Y-%m-%d")
+    msgs = build_day_report(cfg, ledger, day)
+
+    check("یک پیام بیشتر از تعداد ادمین‌ها (خلاصه + هر ادمین)", len(msgs), N_ADMINS + 1)
+    check("پیام اول خلاصه است", "ادمین‌های فعال" in msgs[0], True)
+    check("پیام اول ادمین تکی ندارد", "👤" in msgs[0], False)
+
+    detail = [m for m in msgs[1:] if "👤" in m]
+    check("به تعداد ادمین‌ها پیام جزئیات هست", len(detail), N_ADMINS)
+    check("هر پیام دقیقاً یک ادمین دارد", {m.count("👤") for m in detail}, {1})
+    check("هیچ پیامی از سقف تلگرام رد نمی‌شود", all(len(m) <= 4096 for m in msgs), True)
+    check("شماره‌ی ترتیب در پیام هست", "۱ از ۳۰" in msgs[1], True)
+    check("آخرین پیام شماره‌ی درست دارد", "۳۰ از ۳۰" in msgs[-1], True)
+    check("پاورقی در خلاصه است", "جمع بیل‌شده" in msgs[0], True)
+
+    # هیچ ادمینی نباید جا بیفتد
+    for a in range(1, N_ADMINS + 1):
+        if f"👤 admin_{a:02d}" not in "\n".join(detail):
+            check(f"ادمین admin_{a:02d} در گزارش", False, True)
+    check("هر ۳۰ ادمین در گزارش‌اند", True, True)
+
+    # --- سقف max_admin_messages -------------------------------------- #
+    capped = Config(ledger_path=":memory:", report_per_admin=True, max_admin_messages=5)
+    capped_msgs = build_day_report(capped, ledger, day)
+    check("با سقف ۵ → ۶ پیام", len(capped_msgs), 6)
+    check("فقط ۵ ادمین جزئیات گرفتند", sum(1 for m in capped_msgs if "👤" in m), 5)
+    check("یادداشتِ ادمین‌های جامانده", "باقی‌مانده" in capped_msgs[0], True)
+    check("راهنمای /admin در یادداشت", "/admin" in capped_msgs[0], True)
+
+    # --- صفر یعنی بدون سقف ------------------------------------------- #
+    unlimited = Config(ledger_path=":memory:", report_per_admin=True, max_admin_messages=0)
+    check("سقف صفر = همه", len(build_day_report(unlimited, ledger, day)), N_ADMINS + 1)
+
+    # --- حالت فشرده‌ی قدیمی هنوز کار می‌کند --------------------------- #
+    packed = Config(ledger_path=":memory:", report_per_admin=False)
+    packed_msgs = build_day_report(packed, ledger, day)
+    check("حالت فشرده پیام کمتری می‌دهد", len(packed_msgs) < len(msgs), True)
+    check("حالت فشرده هم زیر سقف تلگرام", all(len(m) <= 4096 for m in packed_msgs), True)
+    check(
+        "حالت فشرده همه‌ی ادمین‌ها را دارد",
+        all(f"admin_{a:02d}" in "\n".join(packed_msgs) for a in range(1, N_ADMINS + 1)),
+        True,
+    )
+
+    # --- یک ادمین با یوزرهای خیلی زیاد از سقف رد نشود ----------------- #
+    big = Config(ledger_path=":memory:", report_per_admin=True, max_users_in_report=60)
+    big_msgs = build_day_report(big, ledger, day)
+    check("ادمین پرحجم هم زیر سقف می‌ماند", all(len(m) <= 4096 for m in big_msgs), True)
+
+
 ALL_TESTS = (
     test_main_scenario,
     test_deleted_before_seen,
@@ -627,6 +694,7 @@ ALL_TESTS = (
     test_backfill_window,
     test_orphan_users,
     test_report_rendering,
+    test_per_admin_report,
     test_telegram_dispatch,
     test_helpers,
     test_env_parsing,

@@ -191,7 +191,49 @@ Then send `/today` to your bot.
 | `backfill_days` | `30` | Only backfill accounts created within this many days |
 | `report_show_user_list` | `true` | Include usernames in the report |
 | `max_users_in_report` | `60` | Beyond this, show a summary instead |
+| `report_per_admin` | `true` | Send **one separate message per admin** |
+| `max_admin_messages` | `50` | Most admins that get a detail message (0 = all) |
+| `message_delay` | `1.2` | Seconds between messages (avoids `429`) |
 | `persian_digits` | `true` | Use Persian digits in messages |
+
+### With many admins
+
+The report is sent as **one summary message plus one separate message per
+admin**, so no message gets crowded however many admins you have — and you can
+forward each admin's own report to them individually:
+
+```
+📊 گزارش حجم ادمین‌ها          ← message 1: summary, one line per admin
+📅 2026-09-22
+──────────────
+👥 ادمین‌های فعال: ۳۰   |   📦 مجموع: 36.62 TB
+🆕 اکانت جدید: ۷۵۰
+
+۱. admin_00 — 1.22 TB  (۲۵ اکانت)
+۲. admin_01 — 1.22 TB  (۲۵ اکانت)
+…
+──────────────
+💰 جمع بیل‌شده: 36.62 TB
+```
+
+```
+📊 گزارش حجم ادمین‌ها          ← message 2: the first admin only
+📅 2026-09-22
+──────────────
+۱ از ۳۰
+👤 admin_00
+   📦 1.22 TB   |   🆕 ۲۵ اکانت   |   🔁 ۰ ریست
+   ├ a00_user_00 — 50 GB
+   ├ a00_user_01 — 50 GB
+   └ … و ۲۳ مورد دیگر (1.13 TB)
+```
+
+If you have more admins than `max_admin_messages`, only the highest-volume ones
+get a detail message; the rest stay in the summary, which reminds you that
+`/admin NAME` fetches any one of them.
+
+Set `report_per_admin = false` to go back to packing admins into fewer, larger
+messages.
 
 ### ⚠️ About the first run
 
@@ -291,7 +333,7 @@ Both are legitimate; they trade off differently:
 | Miss window | zero | `scan_interval` (60 s default) |
 | Survives panel upgrades | a migration can drop it | independent of the panel's internal schema |
 | Interactive reports | no | `/report` `/week` `/admin` `/user` |
-| Automated tests | no | 102 checks + CI |
+| Automated tests | no | 122 checks + CI |
 
 **If your panel runs MySQL/MariaDB**, triggers have no miss window and are the
 better choice. **If you run PostgreSQL or TimescaleDB** — which the PasarGuard
@@ -340,7 +382,7 @@ git clone https://github.com/lastdejavu/pg-accountant.git
 cd pg-accountant
 python3 -m pip install -r requirements.txt pytest
 
-python3 tests/test_accounting.py            # 74 checks (script mode)
+python3 tests/test_accounting.py            # 94 checks (script mode)
 python3 -m pytest tests/test_accounting.py  # the same, under pytest
 bash tests/e2e.sh                           # 28 end-to-end checks via the real CLI
 bash -n install.sh                          # installer syntax
@@ -369,7 +411,7 @@ pg-accountant/
 │   └── test.yml           CI across three Python versions
 └── tests/
     ├── schema_panel.sql   panel schema for tests
-    ├── test_accounting.py 74 unit checks
+    ├── test_accounting.py 94 unit checks
     └── e2e.sh             28 end-to-end checks
 ```
 

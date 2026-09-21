@@ -120,6 +120,9 @@ class Config:
     # رفتار
     report_show_user_list: bool = True  # لیست یوزرنیم‌ها در گزارش بیاید
     max_users_in_report: int = 60       # بیش از این، فقط خلاصه
+    report_per_admin: bool = True       # برای هر ادمین یک پیام جدا فرستاده شود
+    max_admin_messages: int = 50        # حداکثر تعداد ادمین با پیام جزئیات (۰ = همه)
+    message_delay: float = 1.2          # فاصله‌ی بین پیام‌ها به ثانیه (جلوگیری از 429)
     persian_digits: bool = True
     heartbeat_gap_warn_seconds: int = 5 * 60
     # تست
@@ -169,6 +172,7 @@ _BOOL_KEYS = {
     "count_topup",
     "backfill_on_first_run",
     "report_show_user_list",
+    "report_per_admin",
     "persian_digits",
     "dry_run_telegram",
 }
@@ -177,8 +181,10 @@ _INT_KEYS = {
     "reset_drop_tolerance",
     "backfill_days",
     "max_users_in_report",
+    "max_admin_messages",
     "heartbeat_gap_warn_seconds",
 }
+_FLOAT_KEYS = {"message_delay"}
 
 
 def _parse_bool(raw: str) -> bool:
@@ -267,6 +273,8 @@ def load_config(path: str | None) -> Config:
                 setattr(cfg, key, _parse_bool(raw))
             elif key in _INT_KEYS:
                 setattr(cfg, key, int(raw))
+            elif key in _FLOAT_KEYS:
+                setattr(cfg, key, float(raw))
             elif key == "allowed_chat_ids":
                 setattr(cfg, key, _parse_chat_ids(raw))
             else:
@@ -1022,6 +1030,95 @@ def _fmt_bytes(cfg: Config, n: int | None) -> str:
     return human_bytes(n)
 
 
+def _admin_block(
+    cfg: Config,
+    *,
+    admin_name: str,
+    summ: dict[str, Any] | None,
+    admin_events: list[sqlite3.Row],
+    day: str,
+    with_header: bool = False,
+    position: str = "",
+) -> str:
+    """متن گزارشِ یک ادمین را می‌سازد."""
+    total_bytes = summ["total_bytes"] if summ else 0
+    block: list[str] = []
+
+    if with_header:
+        head = f"📊 گزارش حجم ادمین‌ها\n📅 {day}\n──────────────"
+        if position:
+            head += f"\n{position}"
+        block.append(head)
+
+    block.append(f"👤 {admin_name}")
+    block.append(
+        f"   📦 {_fmt_bytes(cfg, total_bytes)}"
+        f"   |   🆕 {_n(cfg, summ['provision_n'] if summ else 0)} اکانت"
+        f"   |   🔁 {_n(cfg, (summ['reset_n'] or 0) if summ else 0)} ریست"
+    )
+
+    if summ and (summ["topup_n"] or 0):
+        block.append(
+            f"   ➕ افزودن حجم: {_n(cfg, summ['topup_n'])} مورد"
+            f" ({_fmt_bytes(cfg, summ['topup_bytes'])})"
+        )
+    if summ and (summ["deleted_n"] or 0):
+        block.append(f"   🗑 حذف‌شده: {_n(cfg, summ['deleted_n'])} اکانت")
+    if summ and (summ["cut_n"] or 0):
+        block.append(f"   ⚠️ کاهش حجم/تغییر مالک: {_n(cfg, summ['cut_n'])} مورد")
+
+    if cfg.report_show_user_list:
+        lines: list[str] = []
+        billed_events = [e for e in admin_events if e["kind"] in BILLED_KINDS]
+        for ev in billed_events[: cfg.max_users_in_report]:
+            tag = ""
+            if ev["kind"] in ("reset", "renewal"):
+                tag = " 🔁"
+            elif ev["kind"] == "topup":
+                tag = " ➕"
+            limit_txt = _fmt_bytes(cfg, ev["data_limit"])
+            used_txt = _fmt_bytes(cfg, ev["used_traffic"])
+            line = f"   ├ {ev['username']} — {limit_txt}"
+            if ev["kind"] in ("reset", "renewal"):
+                line += f" (مصرف قبل: {used_txt})"
+            elif ev["kind"] == "topup":
+                line += f" ({ev['note']})"
+            line += tag
+            lines.append(line)
+        if len(billed_events) > cfg.max_users_in_report:
+            rest = billed_events[cfg.max_users_in_report:]
+            rest_bytes = sum(int(r["bytes"]) for r in rest)
+            lines.append(
+                f"   └ … و {_n(cfg, len(rest))} مورد دیگر"
+                f" ({_fmt_bytes(cfg, rest_bytes)})"
+            )
+        block.extend(lines)
+
+    return "\n".join(block)
+
+
+def _day_footer(
+    cfg: Config, rows: list[sqlite3.Row], totals: dict[str, Any], extra_footer: str
+) -> str:
+    """پاورقی خلاصه‌ی روز."""
+    reset_bytes = sum(int(r["bytes"]) for r in rows if r["kind"] in ("reset", "renewal"))
+    provision_bytes = sum(int(r["bytes"]) for r in rows if r["kind"] == "provision")
+    topup_bytes = sum(int(r["bytes"]) for r in rows if r["kind"] == "topup")
+    deleted_n = sum(1 for r in rows if r["kind"] == "deleted")
+
+    footer = (
+        "──────────────\n"
+        f"🆕 ساخت اکانت: {_fmt_bytes(cfg, provision_bytes)}\n"
+        f"🔁 ریست/تمدید: {_fmt_bytes(cfg, reset_bytes)}\n"
+        f"➕ افزودن حجم: {_fmt_bytes(cfg, topup_bytes)}\n"
+        f"💰 جمع بیل‌شده: {_fmt_bytes(cfg, totals['total_bytes'])}\n"
+        f"🗑 اکانت‌های حذف‌شده: {_n(cfg, deleted_n)}"
+    )
+    if extra_footer:
+        footer += "\n" + extra_footer
+    return footer
+
+
 def build_day_report(
     cfg: Config,
     ledger: Ledger,
@@ -1031,8 +1128,16 @@ def build_day_report(
     extra_footer: str = "",
 ) -> list[str]:
     """
-    گزارش یک روز را می‌سازد و به صورت لیستی از پیام‌ها برمی‌گرداند
-    (به‌خاطر محدودیت ۴۰۹۶ کاراکتری تلگرام).
+    گزارش یک روز را به صورت لیستی از پیام‌ها برمی‌گرداند.
+
+    با `report_per_admin = true` (پیش‌فرض) اول یک پیام خلاصه می‌آید و بعد
+    **یک پیام جداگانه برای هر ادمین**. این‌طور حتی با ده‌ها ادمین هر پیام
+    خوانا می‌ماند و می‌توانی گزارش هر ادمین را جدا برایش فوروارد کنی.
+
+    با `report_per_admin = false` ادمین‌ها تا سقف اندازه در پیام‌های کمتر
+    جمع می‌شوند (پیام کمتر، ولی هر پیام شلوغ‌تر).
+
+    هر پیام برگشتی از ۴۰۰۰ کاراکتر کوتاه‌تر است؛ سقف تلگرام ۴۰۹۶ است.
     """
     summaries = ledger.summary_by_admin(day)
     rows = ledger.day_rows(day)
@@ -1059,9 +1164,69 @@ def build_day_report(
         reverse=True,
     )
 
+    def summ_of(key: str) -> dict[str, Any] | None:
+        return next(
+            (s for s in summaries if f"{s['admin_id']}|{s['admin_name']}" == key),
+            None,
+        )
+
+    def name_of(key: str) -> str:
+        return by_admin[key][0]["admin_name"] or "بدون ادمین"
+
+    footer = _day_footer(cfg, rows, totals, extra_footer)
+
+    # ------------------------------------------------------------------ #
+    # حالت یک پیام به ازای هر ادمین
+    # ------------------------------------------------------------------ #
+    if cfg.report_per_admin:
+        limit = cfg.max_admin_messages
+        detailed = ordered_keys[:limit] if limit > 0 else ordered_keys
+        skipped = ordered_keys[len(detailed):]
+
+        # پیام اول: خلاصه — یک خط برای هر ادمین، مرتب بر پایه‌ی حجم
+        summary = [
+            f"{title_prefix}\n📅 {day}",
+            "──────────────",
+            f"👥 ادمین‌های فعال: {_n(cfg, len(by_admin))}   |   "
+            f"📦 مجموع: {_fmt_bytes(cfg, totals['total_bytes'])}",
+            f"🆕 اکانت جدید: {_n(cfg, totals['accounts'])}",
+            "",
+        ]
+        for idx, key in enumerate(ordered_keys, 1):
+            s = summ_of(key)
+            summary.append(
+                f"{_n(cfg, idx)}. {name_of(key)} — "
+                f"{_fmt_bytes(cfg, s['total_bytes'] if s else 0)}"
+                f"  ({_n(cfg, s['provision_n'] if s else 0)} اکانت)"
+            )
+        summary_text = "\n".join(summary) + "\n\n" + footer
+        if skipped:
+            summary_text += (
+                f"\n\nℹ️ جزئیات فقط برای {_n(cfg, len(detailed))} ادمین اول فرستاده شد؛"
+                f" {_n(cfg, len(skipped))} ادمین باقی‌مانده در همین خلاصه‌اند."
+                "\nبرای دیدن جزئیات هر کدام: /admin نام‌ادمین"
+            )
+
+        messages = _split_message(summary_text, 4000)
+        for idx, key in enumerate(detailed, 1):
+            block = _admin_block(
+                cfg,
+                admin_name=name_of(key),
+                summ=summ_of(key),
+                admin_events=by_admin[key],
+                day=day,
+                with_header=True,
+                position=f"{_n(cfg, idx)} از {_n(cfg, len(by_admin))}",
+            )
+            messages.extend(_split_message(block, 4000))
+        return messages
+
+    # ------------------------------------------------------------------ #
+    # حالت فشرده: ادمین‌ها را تا سقف اندازه در یک پیام جمع کن
+    # ------------------------------------------------------------------ #
     header = (
         f"{title_prefix}\n📅 {day}\n"
-        f"──────────────\n"
+        "──────────────\n"
         f"👥 ادمین‌های فعال: {_n(cfg, len(by_admin))}   |   "
         f"📦 مجموع: {_fmt_bytes(cfg, totals['total_bytes'])}\n"
         f"🆕 اکانت جدید: {_n(cfg, totals['accounts'])}\n"
@@ -1072,93 +1237,28 @@ def build_day_report(
 
     def flush() -> None:
         nonlocal current
-        if current:
-            chunks.append(current)
-            current = ""
+        if current.strip():
+            chunks.append(current.rstrip("\n"))
+        current = ""
 
     for key in ordered_keys:
-        admin_events = by_admin[key]
-        summ = next(
-            (s for s in summaries if f"{s['admin_id']}|{s['admin_name']}" == key),
-            None,
-        )
-        admin_name = admin_events[0]["admin_name"] or "بدون ادمین"
-        total_bytes = summ["total_bytes"] if summ else 0
-
-        block = [
-            f"👤 {admin_name}",
-            f"   📦 {_fmt_bytes(cfg, total_bytes)}"
-            f"   |   🆕 {_n(cfg, summ['provision_n'] if summ else 0)} اکانت"
-            f"   |   🔁 {_n(cfg, (summ['reset_n'] or 0) if summ else 0)} ریست",
-        ]
-
-        if summ and (summ["topup_n"] or 0):
-            block.append(
-                f"   ➕ افزودن حجم: {_n(cfg, summ['topup_n'])} مورد"
-                f" ({_fmt_bytes(cfg, summ['topup_bytes'])})"
+        text_block = (
+            _admin_block(
+                cfg,
+                admin_name=name_of(key),
+                summ=summ_of(key),
+                admin_events=by_admin[key],
+                day=day,
             )
-        if summ and (summ["deleted_n"] or 0):
-            block.append(f"   🗑 حذف‌شده: {_n(cfg, summ['deleted_n'])} اکانت")
-        if summ and (summ["cut_n"] or 0):
-            block.append(f"   ⚠️ کاهش حجم/تغییر مالک: {_n(cfg, summ['cut_n'])} مورد")
-
-        if cfg.report_show_user_list:
-            lines: list[str] = []
-            billed_events = [e for e in admin_events if e["kind"] in BILLED_KINDS]
-            for ev in billed_events[: cfg.max_users_in_report]:
-                tag = ""
-                if ev["kind"] in ("reset", "renewal"):
-                    tag = " 🔁"
-                elif ev["kind"] == "topup":
-                    tag = " ➕"
-                limit_txt = _fmt_bytes(cfg, ev["data_limit"])
-                used_txt = _fmt_bytes(cfg, ev["used_traffic"])
-                line = f"   ├ {ev['username']} — {limit_txt}"
-                if ev["kind"] in ("reset", "renewal"):
-                    line += f" (مصرف قبل: {used_txt})"
-                elif ev["kind"] == "topup":
-                    line += f" ({ev['note']})"
-                line += tag
-                lines.append(line)
-            if len(billed_events) > cfg.max_users_in_report:
-                rest = billed_events[cfg.max_users_in_report:]
-                rest_bytes = sum(int(r["bytes"]) for r in rest)
-                lines.append(
-                    f"   └ … و {_n(cfg, len(rest))} مورد دیگر"
-                    f" ({_fmt_bytes(cfg, rest_bytes)})"
-                )
-            block.extend(lines)
-
-        block.append("")  # فاصله
-        text_block = "\n".join(block)
-
-        if len(current) + len(text_block) + 2 > 3800:
+            + "\n"
+        )
+        if len(current) + len(text_block) + 1 > 3800:
             flush()
-        current += ("\n" if current else "") + text_block
+        current += text_block
 
     flush()
-
-    # پاورقی خلاصه
-    reset_bytes = sum(int(r["bytes"]) for r in rows if r["kind"] in ("reset", "renewal"))
-    provision_bytes = sum(int(r["bytes"]) for r in rows if r["kind"] == "provision")
-    topup_bytes = sum(int(r["bytes"]) for r in rows if r["kind"] == "topup")
-    deleted_n = sum(1 for r in rows if r["kind"] == "deleted")
-
-    footer = (
-        "──────────────\n"
-        f"🆕 ساخت اکانت: {_fmt_bytes(cfg, provision_bytes)}\n"
-        f"🔁 ریست/تمدید: {_fmt_bytes(cfg, reset_bytes)}\n"
-        f"➕ افزودن حجم: {_fmt_bytes(cfg, topup_bytes)}\n"
-        f"💰 جمع بیل‌شده: {_fmt_bytes(cfg, totals['total_bytes'])}\n"
-        f"🗑 اکانت‌های حذف‌شده: {_n(cfg, deleted_n)}"
-    )
-    if extra_footer:
-        footer += "\n" + extra_footer
-    if len(chunks) == 1:
-        chunks[0] += "\n" + footer
-    else:
-        chunks.append(footer)
-    return chunks
+    chunks.append(footer)
+    return [c for c in chunks if c.strip()]
 
 
 def build_status_report(cfg: Config, ledger: Ledger) -> str:
@@ -1197,6 +1297,10 @@ class TelegramBot:
     def send(self, chat_id: int, text: str) -> None:
         for chunk in _split_message(text, 4000):
             self._send_chunk(chat_id, chunk)
+            # تلگرام در هر گروه حدود ۲۰ پیام در دقیقه اجازه می‌دهد؛ با گزارش
+            # چندادمینی بدون این فاصله 429 می‌گیریم.
+            if self.cfg.message_delay > 0:
+                time.sleep(self.cfg.message_delay)
 
     def _send_chunk(self, chat_id: int, chunk: str) -> None:
         if self.cfg.dry_run_telegram:

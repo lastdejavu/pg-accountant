@@ -190,7 +190,49 @@ sudo tail -f /var/log/pg-accountant.log
 | `backfill_days` | `30` | فقط اکانت‌های این چند روز اخیر backfill شوند |
 | `report_show_user_list` | `true` | فهرست یوزرنیم‌ها در گزارش بیاید |
 | `max_users_in_report` | `60` | بیشتر از این، فقط خلاصه |
+| `report_per_admin` | `true` | **برای هر ادمین یک پیام جدا** فرستاده شود |
+| `max_admin_messages` | `50` | حداکثر ادمینی که پیام جزئیات می‌گیرد (۰ = همه) |
+| `message_delay` | `1.2` | فاصله‌ی بین پیام‌ها به ثانیه (جلوگیری از `429`) |
 | `persian_digits` | `true` | ارقام فارسی در پیام‌ها |
+
+### اگر ادمین‌هایت زیادند
+
+گزارش به‌صورت **یک پیام خلاصه + یک پیام جدا برای هر ادمین** می‌رود، پس با
+ده‌ها ادمین هم هیچ پیامی شلوغ نمی‌شود و می‌توانی گزارش هر ادمین را جدا برایش
+فوروارد کنی:
+
+```
+📊 گزارش حجم ادمین‌ها          ← پیام ۱: خلاصه، یک خط برای هر ادمین
+📅 2026-09-22
+──────────────
+👥 ادمین‌های فعال: ۳۰   |   📦 مجموع: 36.62 TB
+🆕 اکانت جدید: ۷۵۰
+
+۱. admin_00 — 1.22 TB  (۲۵ اکانت)
+۲. admin_01 — 1.22 TB  (۲۵ اکانت)
+…
+──────────────
+💰 جمع بیل‌شده: 36.62 TB
+```
+
+```
+📊 گزارش حجم ادمین‌ها          ← پیام ۲: فقط ادمین اول
+📅 2026-09-22
+──────────────
+۱ از ۳۰
+👤 admin_00
+   📦 1.22 TB   |   🆕 ۲۵ اکانت   |   🔁 ۰ ریست
+   ├ a00_user_00 — 50 GB
+   ├ a00_user_01 — 50 GB
+   └ … و ۲۳ مورد دیگر (1.13 TB)
+```
+
+اگر تعداد ادمین‌ها از `max_admin_messages` بیشتر شود، فقط آن‌ها که حجم
+بیشتری دارند پیام جزئیات می‌گیرند و بقیه در همان خلاصه می‌مانند؛ خلاصه هم
+یادآوری می‌کند که با `/admin نام‌ادمین` می‌توانی جزئیات هر کدام را بگیری.
+
+با `report_per_admin = false` برمی‌گردد به حالت فشرده (ادمین‌ها تا سقف
+اندازه در یک پیام).
 
 ### ⚠️ درباره‌ی اولین اجرا
 
@@ -289,7 +331,7 @@ await db.execute(delete(UserUsageResetLogs).where(UserUsageResetLogs.user_id.in_
 | پنجره‌ی از دست رفتن | صفر | `scan_interval` (پیش‌فرض ۶۰ ثانیه) |
 | دوام بعد از آپدیت پنل | ممکن است migration آن را بپراند | مستقل از اسکیمای داخلی پنل |
 | گزارش‌های تعاملی | ندارد | `/report` `/week` `/admin` `/user` |
-| تست خودکار | ندارد | ۱۰۲ بررسی + CI |
+| تست خودکار | ندارد | ۱۲۲ بررسی + CI |
 
 **اگر پنلت MySQL/MariaDB است**، روش Trigger پنجره‌ی از دست رفتن ندارد و انتخاب
 بهتری است. **اگر PostgreSQL یا TimescaleDB داری** (که خودِ مستندات پاسارگارد
@@ -335,7 +377,7 @@ git clone https://github.com/lastdejavu/pg-accountant.git
 cd pg-accountant
 python3 -m pip install -r requirements.txt pytest
 
-python3 tests/test_accounting.py            # ۷۴ بررسی (حالت اسکریپت)
+python3 tests/test_accounting.py            # ۹۴ بررسی (حالت اسکریپت)
 python3 -m pytest tests/test_accounting.py  # همان، زیر pytest
 bash tests/e2e.sh                           # ۲۸ بررسی end-to-end با CLI واقعی
 bash -n install.sh                          # سینتکس نصب
@@ -363,7 +405,7 @@ pg-accountant/
 │   └── test.yml           CI روی سه نسخه‌ی پایتون
 └── tests/
     ├── schema_panel.sql   اسکیمای پنل برای تست
-    ├── test_accounting.py ۷۴ بررسی واحد
+    ├── test_accounting.py ۹۴ بررسی واحد
     └── e2e.sh             ۲۸ بررسی end-to-end
 ```
 
