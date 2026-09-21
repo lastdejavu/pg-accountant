@@ -1,0 +1,19 @@
+# تنظیمات واقعی و داده‌ها — هرگز commit نشوند
+config.ini
+.env
+ledger.db
+ledger.db-journal
+ledger.db-wal
+ledger.db-shm
+*.log
+
+# پایتون
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ابزارها
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
